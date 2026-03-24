@@ -137,18 +137,18 @@ type SPFFlattenInfo struct {
 }
 
 type JSONResult struct {
-	Timestamp      string             `json:"timestamp"`
-	Domain         string             `json:"domain"`
-	SPFRecords     []string           `json:"spf_records,omitempty"`
-	SPFFlatten     *SPFFlattenInfo    `json:"spf_flatten,omitempty"`
-	SPFCheck       *JSONSPFCheck      `json:"spf_check,omitempty"`
-	DKIMDNS        *DKIMRecord        `json:"dkim_dns,omitempty"`
-	DKIMSignatures []JSONDKIMSignature `json:"dkim_signatures,omitempty"`
-	DMARC          *JSONDMARC         `json:"dmarc,omitempty"`
-	Alignment      *JSONAlignment     `json:"alignment,omitempty"`
-	DMARCResult    *JSONDMARCResult   `json:"dmarc_result,omitempty"`
-	EmailAutofill  *JSONAutofill      `json:"email_autofill,omitempty"`
-	Errors         []string           `json:"errors,omitempty"`
+	Timestamp      string              `json:"timestamp"`
+	Domain         string              `json:"domain"`
+	SPFRecords     []string            `json:"spf_records,omitempty"`
+	SPFFlatten     *SPFFlattenInfo     `json:"spf_flatten,omitempty"`
+	SPFCheck       *JSONSPFCheck       `json:"spf_check,omitempty"`
+	DKIMDNS        *DKIMRecord         `json:"dkim_dns,omitempty"`
+	DKIMSignatures []JSONDKIMSignature  `json:"dkim_signatures,omitempty"`
+	DMARC          *JSONDMARC          `json:"dmarc,omitempty"`
+	Alignment      *JSONAlignment      `json:"alignment,omitempty"`
+	DMARCResult    *JSONDMARCResult    `json:"dmarc_result,omitempty"`
+	EmailAutofill  *JSONAutofill       `json:"email_autofill,omitempty"`
+	Errors         []string            `json:"errors,omitempty"`
 }
 
 // ============================================================
@@ -227,6 +227,20 @@ func aligned(fromDomain, otherDomain, mode string) bool {
 		return fromDomain == otherDomain
 	}
 	return orgDomain(fromDomain) == orgDomain(otherDomain)
+}
+
+// dkimSelector extrait le sélecteur depuis v.Identifier (format "local@domain"
+// où local = sélecteur si présent, sinon chaîne vide).
+// Identifier est soit "@domain" (pas de sélecteur explicite) soit "s=sel@domain"
+// mais l'API go-msgauth stocke directement la valeur du tag i= qui est
+// en pratique le local-part avant le @. On retourne ce local-part.
+func dkimSelectorFromVerification(v *dkim.Verification) string {
+	id := v.Identifier // e.g. "@example.com" ou "selector@example.com"
+	at := strings.Index(id, "@")
+	if at <= 0 {
+		return ""
+	}
+	return id[:at]
 }
 
 // ============================================================
@@ -330,11 +344,12 @@ func findSPFRecords(domain string) (*SPFRecord, error) {
 // SPF — check IP/MFROM (lib blitiri)
 // ============================================================
 
+// checkSPF vérifie l'autorisation SPF pour ip/mailFrom/helo.
+// Le contexte est passé via spf.WithContext() (Option variadique).
 func checkSPF(ip net.IP, mailFrom, helo string) (spf.Result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := spf.CheckHostWithSender(ctx, ip, helo, mailFrom, nil)
-	return res, err
+	return spf.CheckHostWithSender(ip, helo, mailFrom, spf.WithContext(ctx))
 }
 
 // ============================================================
@@ -748,7 +763,8 @@ func printDKIMVerifications(vs []*dkim.Verification) {
 		if v.Err == nil {
 			status = "VALID"
 		}
-		fmt.Printf("Signature %d: %s (d=%s, s=%s, err=%v)\n", i+1, status, v.Domain, v.Selector, v.Err)
+		sel := dkimSelectorFromVerification(v)
+		fmt.Printf("Signature %d: %s (d=%s, s=%s, err=%v)\n", i+1, status, v.Domain, sel, v.Err)
 	}
 }
 
@@ -998,7 +1014,7 @@ func main() {
 			for _, v := range verifs {
 				s := JSONDKIMSignature{
 					Domain:   v.Domain,
-					Selector: v.Selector,
+					Selector: dkimSelectorFromVerification(v),
 					Valid:    v.Err == nil,
 				}
 				if v.Err != nil {
