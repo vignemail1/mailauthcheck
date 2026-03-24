@@ -12,12 +12,12 @@ import (
 	"net/mail"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"blitiri.com.ar/go/spf"
-	"github.com/emersion/go-dkim"
-	"github.com/mjl-/mox/dmarc"
+	"github.com/emersion/go-msgauth/dkim"
 )
 
 // ============================================================
@@ -33,9 +33,20 @@ type DKIMRecord struct {
 	Tags map[string]string `json:"tags,omitempty"`
 }
 
+// DMARCRecord est notre parser DMARC stdlib pur (pas de dépendance externe).
+type DMARCRecord struct {
+	Policy          string
+	SubdomainPolicy string
+	SPFAlignment    string
+	DKIMAlignment   string
+	Percentage      int
+	RUA             []string
+	RUF             []string
+}
+
 type DMARCInfo struct {
 	Raw    string
-	Record dmarc.Record
+	Record DMARCRecord
 }
 
 type SPFNetwork struct {
@@ -117,28 +128,27 @@ type JSONAutofill struct {
 	} `json:"used"`
 }
 
-// SPFFlattenInfo décrit l'état du flatten SPF
 type SPFFlattenInfo struct {
-	Networks       []SPFNetwork `json:"networks,omitempty"`
-	LookupCount    int          `json:"lookup_count"`
-	LimitReached   bool         `json:"limit_reached"`
-	UnsupportedTerms []string   `json:"unsupported_terms,omitempty"`
-	Errors         []string     `json:"errors,omitempty"`
+	Networks         []SPFNetwork `json:"networks,omitempty"`
+	LookupCount      int          `json:"lookup_count"`
+	LimitReached     bool         `json:"limit_reached"`
+	UnsupportedTerms []string     `json:"unsupported_terms,omitempty"`
+	Errors           []string     `json:"errors,omitempty"`
 }
 
 type JSONResult struct {
-	Timestamp      string               `json:"timestamp"`
-	Domain         string               `json:"domain"`
-	SPFRecords     []string             `json:"spf_records,omitempty"`
-	SPFFlatten     *SPFFlattenInfo      `json:"spf_flatten,omitempty"`
-	SPFCheck       *JSONSPFCheck        `json:"spf_check,omitempty"`
-	DKIMDNS        *DKIMRecord          `json:"dkim_dns,omitempty"`
-	DKIMSignatures []JSONDKIMSignature   `json:"dkim_signatures,omitempty"`
-	DMARC          *JSONDMARC           `json:"dmarc,omitempty"`
-	Alignment      *JSONAlignment       `json:"alignment,omitempty"`
-	DMARCResult    *JSONDMARCResult     `json:"dmarc_result,omitempty"`
-	EmailAutofill  *JSONAutofill        `json:"email_autofill,omitempty"`
-	Errors         []string             `json:"errors,omitempty"`
+	Timestamp      string             `json:"timestamp"`
+	Domain         string             `json:"domain"`
+	SPFRecords     []string           `json:"spf_records,omitempty"`
+	SPFFlatten     *SPFFlattenInfo    `json:"spf_flatten,omitempty"`
+	SPFCheck       *JSONSPFCheck      `json:"spf_check,omitempty"`
+	DKIMDNS        *DKIMRecord        `json:"dkim_dns,omitempty"`
+	DKIMSignatures []JSONDKIMSignature `json:"dkim_signatures,omitempty"`
+	DMARC          *JSONDMARC         `json:"dmarc,omitempty"`
+	Alignment      *JSONAlignment     `json:"alignment,omitempty"`
+	DMARCResult    *JSONDMARCResult   `json:"dmarc_result,omitempty"`
+	EmailAutofill  *JSONAutofill      `json:"email_autofill,omitempty"`
+	Errors         []string           `json:"errors,omitempty"`
 }
 
 // ============================================================
@@ -190,8 +200,6 @@ func domainFromAddr(addr string) (string, error) {
 	return strings.ToLower(addr[i+1:]), nil
 }
 
-// orgDomain retourne le domaine organisationnel (2 derniers labels).
-// Pour une implémentation complète, utiliser une lib PSL.
 func orgDomain(d string) string {
 	parts := strings.Split(strings.ToLower(d), ".")
 	if len(parts) <= 2 {
@@ -200,7 +208,6 @@ func orgDomain(d string) string {
 	return strings.Join(parts[len(parts)-2:], ".")
 }
 
-// isSubdomain retourne true si sub est un sous-domaine strict de parent.
 func isSubdomain(sub, parent string) bool {
 	sub = strings.ToLower(sub)
 	parent = strings.ToLower(parent)
@@ -220,6 +227,82 @@ func aligned(fromDomain, otherDomain, mode string) bool {
 		return fromDomain == otherDomain
 	}
 	return orgDomain(fromDomain) == orgDomain(otherDomain)
+}
+
+// ============================================================
+// DMARC — parser stdlib pur (RFC 7489)
+// ============================================================
+
+func parseDMARCRecord(raw string) (DMARCRecord, error) {
+	rec := DMARCRecord{
+		Percentage:    100,
+		SPFAlignment:  "r",
+		DKIMAlignment: "r",
+	}
+	tags := parseTagList(raw)
+
+	v, ok := tags["v"]
+	if !ok || !strings.EqualFold(v, "DMARC1") {
+		return rec, fmt.Errorf("tag v=DMARC1 manquant ou invalide")
+	}
+
+	if p, ok := tags["p"]; ok {
+		switch strings.ToLower(p) {
+		case "none", "quarantine", "reject":
+			rec.Policy = strings.ToLower(p)
+		default:
+			return rec, fmt.Errorf("valeur p= invalide: %q", p)
+		}
+	} else {
+		return rec, fmt.Errorf("tag p= obligatoire manquant")
+	}
+
+	if sp, ok := tags["sp"]; ok {
+		switch strings.ToLower(sp) {
+		case "none", "quarantine", "reject":
+			rec.SubdomainPolicy = strings.ToLower(sp)
+		}
+	}
+
+	if aspf, ok := tags["aspf"]; ok {
+		switch strings.ToLower(aspf) {
+		case "r", "s":
+			rec.SPFAlignment = strings.ToLower(aspf)
+		}
+	}
+
+	if adkim, ok := tags["adkim"]; ok {
+		switch strings.ToLower(adkim) {
+		case "r", "s":
+			rec.DKIMAlignment = strings.ToLower(adkim)
+		}
+	}
+
+	if pct, ok := tags["pct"]; ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(pct)); err == nil && n >= 0 && n <= 100 {
+			rec.Percentage = n
+		}
+	}
+
+	if rua, ok := tags["rua"]; ok {
+		for _, u := range strings.Split(rua, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				rec.RUA = append(rec.RUA, u)
+			}
+		}
+	}
+
+	if ruf, ok := tags["ruf"]; ok {
+		for _, u := range strings.Split(ruf, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				rec.RUF = append(rec.RUF, u)
+			}
+		}
+	}
+
+	return rec, nil
 }
 
 // ============================================================
@@ -244,7 +327,7 @@ func findSPFRecords(domain string) (*SPFRecord, error) {
 }
 
 // ============================================================
-// SPF — check IP/MFROM (lib blitiri, gère include/redirect/limite)
+// SPF — check IP/MFROM (lib blitiri)
 // ============================================================
 
 func checkSPF(ip net.IP, mailFrom, helo string) (spf.Result, error) {
@@ -298,10 +381,7 @@ func (c *spfFlattenCtx) consumeLookup() bool {
 
 func (c *spfFlattenCtx) flattenDomain(domain, source string) {
 	domain = strings.ToLower(domain)
-	if c.visited[domain] {
-		return
-	}
-	if c.limitReached {
+	if c.visited[domain] || c.limitReached {
 		return
 	}
 	c.visited[domain] = true
@@ -326,7 +406,6 @@ func (c *spfFlattenCtx) flattenDomain(domain, source string) {
 			if term == "" {
 				continue
 			}
-			// strip qualifier
 			switch term[0] {
 			case '+', '-', '~', '?':
 				if len(term) == 1 {
@@ -337,23 +416,17 @@ func (c *spfFlattenCtx) flattenDomain(domain, source string) {
 
 			switch {
 			case strings.HasPrefix(term, "include:"):
-				if c.limitReached {
-					break
+				if !c.limitReached {
+					c.flattenDomain(strings.TrimPrefix(term, "include:"), domain)
 				}
-				c.flattenDomain(strings.TrimPrefix(term, "include:"), domain)
-
 			case strings.HasPrefix(term, "redirect="):
-				if c.limitReached {
-					break
+				if !c.limitReached {
+					c.flattenDomain(strings.TrimPrefix(term, "redirect="), domain)
 				}
-				c.flattenDomain(strings.TrimPrefix(term, "redirect="), domain)
-
 			case strings.HasPrefix(term, "ip4:"):
 				c.nets = append(c.nets, SPFNetwork{CIDR: strings.TrimPrefix(term, "ip4:"), Source: domain})
-
 			case strings.HasPrefix(term, "ip6:"):
 				c.nets = append(c.nets, SPFNetwork{CIDR: strings.TrimPrefix(term, "ip6:"), Source: domain})
-
 			case term == "a" || strings.HasPrefix(term, "a:") || strings.HasPrefix(term, "a/"):
 				if !c.consumeLookup() {
 					break
@@ -374,7 +447,6 @@ func (c *spfFlattenCtx) flattenDomain(domain, source string) {
 						c.nets = append(c.nets, SPFNetwork{CIDR: ip.String() + "/128", Source: host})
 					}
 				}
-
 			case term == "mx" || strings.HasPrefix(term, "mx:") || strings.HasPrefix(term, "mx/"):
 				if !c.consumeLookup() {
 					break
@@ -405,13 +477,10 @@ func (c *spfFlattenCtx) flattenDomain(domain, source string) {
 						}
 					}
 				}
-
 			case term == "all" || term == "+all" || term == "-all" || term == "~all" || term == "?all":
-				// terminateur, rien à résoudre
-
+				// terminateur
 			case strings.HasPrefix(term, "exists:") || strings.HasPrefix(term, "ptr") || strings.Contains(term, "%{"):
 				c.unsupportedTerms = append(c.unsupportedTerms, term)
-
 			default:
 				c.unsupportedTerms = append(c.unsupportedTerms, term)
 			}
@@ -464,7 +533,7 @@ func findDKIMRecord(domain, selector string) (*DKIMRecord, error) {
 // DKIM — vérification signature email
 // ============================================================
 
-func verifyDKIMMessage(r io.Reader) ([]dkim.Verification, error) {
+func verifyDKIMMessage(r io.Reader) ([]*dkim.Verification, error) {
 	return dkim.Verify(r)
 }
 
@@ -488,12 +557,9 @@ func findDMARC(domain string) (*DMARCInfo, error) {
 	if dmarcTxt == "" {
 		return nil, fmt.Errorf("aucun enregistrement DMARC trouvé")
 	}
-	rec, isDMARC, err := dmarc.ParseRecord(dmarcTxt)
+	rec, err := parseDMARCRecord(dmarcTxt)
 	if err != nil {
-		return nil, fmt.Errorf("erreur de parse DMARC: %w (isDMARC=%v)", err, isDMARC)
-	}
-	if !isDMARC {
-		return nil, fmt.Errorf("record DMARC invalide")
+		return nil, fmt.Errorf("erreur de parse DMARC: %w", err)
 	}
 	return &DMARCInfo{Raw: dmarcTxt, Record: rec}, nil
 }
@@ -536,10 +602,7 @@ func extractFromEmail(raw []byte) (*EmailExtract, error) {
 	for i := len(recvs) - 1; i >= 0; i-- {
 		for _, ipStr := range ipAnyRe.FindAllString(recvs[i], -1) {
 			ip := net.ParseIP(ipStr)
-			if ip == nil {
-				continue
-			}
-			if ip.IsLoopback() || ip.IsPrivate() {
+			if ip == nil || ip.IsLoopback() || ip.IsPrivate() {
 				continue
 			}
 			res.ClientIPs = append(res.ClientIPs, ip.String())
@@ -556,46 +619,32 @@ func extractFromEmail(raw []byte) (*EmailExtract, error) {
 // ============================================================
 
 func buildAlignment(fromDomain, mailFromDomain, dkimDomain string, dm *DMARCInfo) *JSONAlignment {
-	aspf := string(dm.Record.SPFAlignment)
-	if aspf == "" {
-		aspf = "r"
-	}
-	adkim := string(dm.Record.DKIMAlignment)
-	if adkim == "" {
-		adkim = "r"
-	}
 	return &JSONAlignment{
 		FromDomain:     fromDomain,
 		MailFromDomain: mailFromDomain,
 		DKIMDomain:     dkimDomain,
-		ASPF:           aspf,
-		ADKIM:          adkim,
-		SPFAligned:     aligned(fromDomain, mailFromDomain, aspf),
-		DKIMAligned:    aligned(fromDomain, dkimDomain, adkim),
+		ASPF:           dm.Record.SPFAlignment,
+		ADKIM:          dm.Record.DKIMAlignment,
+		SPFAligned:     aligned(fromDomain, mailFromDomain, dm.Record.SPFAlignment),
+		DKIMAligned:    aligned(fromDomain, dkimDomain, dm.Record.DKIMAlignment),
 	}
 }
 
 func buildDMARCResult(dm *DMARCInfo, align *JSONAlignment, spfCheck *JSONSPFCheck, dkimSigs []JSONDKIMSignature, fromDomain string) *JSONDMARCResult {
 	res := &JSONDMARCResult{}
 	if dm == nil || align == nil {
-		res.Evaluated = false
 		res.Reason = "DMARC ou alignement indisponible"
 		return res
 	}
 	res.Evaluated = true
-
-	// pct=
 	res.Pct = dm.Record.Percentage
 	if res.Pct == 0 {
 		res.Pct = 100
 	}
 
-	// SPF pass
 	if spfCheck != nil {
 		res.SPFPass = (spfCheck.Result == "pass")
 	}
-
-	// DKIM pass (au moins une signature valide)
 	for _, s := range dkimSigs {
 		if s.Valid {
 			res.DKIMPass = true
@@ -605,7 +654,6 @@ func buildDMARCResult(dm *DMARCInfo, align *JSONAlignment, spfCheck *JSONSPFChec
 
 	res.SPFAligned = align.SPFAligned
 	res.DKIMAligned = align.DKIMAligned
-
 	spfOk := res.SPFPass && res.SPFAligned
 	dkimOk := res.DKIMPass && res.DKIMAligned
 	res.Pass = spfOk || dkimOk
@@ -621,24 +669,18 @@ func buildDMARCResult(dm *DMARCInfo, align *JSONAlignment, spfCheck *JSONSPFChec
 		res.Reason = "Ni SPF ni DKIM ne passent avec alignement DMARC"
 	}
 
-	// Politique
 	policy := dm.Record.Policy
 	if policy == "" {
 		policy = "none"
 	}
 	res.Policy = policy
 
-	// Politique effective: sp= si from est un sous-domaine du domaine analysé
 	effective := policy
-	if dm.Record.SubdomainPolicy != "" && fromDomain != "" {
-		// récupère le domaine de la policy depuis le record (normalement = domaine analysé)
-		if isSubdomain(fromDomain, orgDomain(fromDomain)) {
-			effective = dm.Record.SubdomainPolicy
-		}
+	if dm.Record.SubdomainPolicy != "" && isSubdomain(fromDomain, orgDomain(fromDomain)) {
+		effective = dm.Record.SubdomainPolicy
 	}
 	res.EffectivePolicy = effective
 
-	// Action finale
 	if res.Pass {
 		res.Action = "none"
 	} else {
@@ -681,10 +723,8 @@ func printSPFFlatten(info *SPFFlattenInfo) {
 	if len(info.UnsupportedTerms) > 0 {
 		fmt.Printf("Termes non résolus (exists/ptr/macro) : %s\n", strings.Join(info.UnsupportedTerms, ", "))
 	}
-	if len(info.Errors) > 0 {
-		for _, e := range info.Errors {
-			fmt.Printf("  ERREUR: %s\n", e)
-		}
+	for _, e := range info.Errors {
+		fmt.Printf("  ERREUR: %s\n", e)
 	}
 }
 
@@ -697,7 +737,7 @@ func printDKIM(dk *DKIMRecord) {
 	}
 }
 
-func printDKIMVerifications(vs []dkim.Verification) {
+func printDKIMVerifications(vs []*dkim.Verification) {
 	fmt.Println("=== DKIM Verify ===")
 	if len(vs) == 0 {
 		fmt.Println("Aucune signature DKIM trouvée.")
@@ -722,8 +762,8 @@ func printDMARC(info *DMARCInfo) {
 	fmt.Printf("Alignement aspf   : %s\n", info.Record.SPFAlignment)
 	fmt.Printf("Alignement adkim  : %s\n", info.Record.DKIMAlignment)
 	fmt.Printf("Pourcentage pct   : %d\n", info.Record.Percentage)
-	fmt.Printf("rua               : %v\n", info.Record.AggregateReportURIs)
-	fmt.Printf("ruf               : %v\n", info.Record.ForensicReportURIs)
+	fmt.Printf("rua               : %v\n", info.Record.RUA)
+	fmt.Printf("ruf               : %v\n", info.Record.RUF)
 }
 
 func printAlignment(align *JSONAlignment) {
@@ -796,7 +836,6 @@ func main() {
 	var jsonErrors []string
 	var emailRaw []byte
 
-	// Lecture du fichier email
 	if *emailFile != "" {
 		f, err := os.Open(*emailFile)
 		if err != nil {
@@ -815,23 +854,22 @@ func main() {
 		}
 	}
 
-	// Autofill depuis l'email
 	var emailExtract *EmailExtract
 	if *autofill && len(emailRaw) > 0 {
 		if ext, err := extractFromEmail(emailRaw); err != nil {
 			jsonErrors = append(jsonErrors, fmt.Sprintf("autofill: %v", err))
 		} else {
 			emailExtract = ext
-			if *headerFrom == "" && ext.HeaderFrom != "" {
+			if *headerFrom == "" {
 				*headerFrom = ext.HeaderFrom
 			}
-			if *mailFrom == "" && ext.MailFrom != "" {
+			if *mailFrom == "" {
 				*mailFrom = ext.MailFrom
 			}
-			if *dkimD == "" && ext.DKIMDomain != "" {
+			if *dkimD == "" {
 				*dkimD = ext.DKIMDomain
 			}
-			if *dkimSelector == "" && ext.DKIMSelector != "" {
+			if *dkimSelector == "" {
 				*dkimSelector = ext.DKIMSelector
 			}
 			if *ipStr == "" && len(ext.ClientIPs) > 0 {
@@ -842,7 +880,6 @@ func main() {
 
 	isJSON := *jsonOut || *jsonlOut
 
-	// SPF: lookup
 	if s, err := findSPFRecords(*domain); err != nil {
 		jsonErrors = append(jsonErrors, fmt.Sprintf("SPF: %v", err))
 		if !isJSON {
@@ -857,7 +894,6 @@ func main() {
 		}
 	}
 
-	// SPF flatten
 	if *doFlatten {
 		info := flattenSPF(*domain, *permissive)
 		result.SPFFlatten = info
@@ -867,7 +903,6 @@ func main() {
 		}
 	}
 
-	// DKIM: lookup DNS
 	if *dkimSelector != "" {
 		if dk, err := findDKIMRecord(*domain, *dkimSelector); err != nil {
 			jsonErrors = append(jsonErrors, fmt.Sprintf("DKIM DNS: %v", err))
@@ -888,7 +923,6 @@ func main() {
 		fmt.Println()
 	}
 
-	// DMARC: lookup + parse
 	var dmarcInfo *DMARCInfo
 	if dm, err := findDMARC(*domain); err != nil {
 		jsonErrors = append(jsonErrors, fmt.Sprintf("DMARC: %v", err))
@@ -906,10 +940,10 @@ func main() {
 			Raw:             dm.Raw,
 			Policy:          dm.Record.Policy,
 			SubdomainPolicy: dm.Record.SubdomainPolicy,
-			ASPF:            string(dm.Record.SPFAlignment),
-			ADKIM:           string(dm.Record.DKIMAlignment),
-			RUA:             dm.Record.AggregateReportURIs,
-			RUF:             dm.Record.ForensicReportURIs,
+			ASPF:            dm.Record.SPFAlignment,
+			ADKIM:           dm.Record.DKIMAlignment,
+			RUA:             dm.Record.RUA,
+			RUF:             dm.Record.RUF,
 			Pct:             pct,
 		}
 		if !isJSON {
@@ -918,7 +952,6 @@ func main() {
 		}
 	}
 
-	// SPF: check IP + MAIL FROM
 	if *ipStr != "" && *mailFrom != "" {
 		ip := net.ParseIP(*ipStr)
 		if ip == nil {
@@ -930,12 +963,8 @@ func main() {
 				MailFrom: *mailFrom,
 				Helo:     *helo,
 			}
-			if err != nil {
-				if *permissive {
-					jc.Result = string(res)
-				} else {
-					jc.Error = err.Error()
-				}
+			if err != nil && !*permissive {
+				jc.Error = err.Error()
 			} else {
 				jc.Result = string(res)
 			}
@@ -956,7 +985,6 @@ func main() {
 		fmt.Println()
 	}
 
-	// DKIM verify sur email brut
 	if len(emailRaw) > 0 {
 		verifs, err := verifyDKIMMessage(bytes.NewReader(emailRaw))
 		if err != nil && !*permissive {
@@ -994,7 +1022,6 @@ func main() {
 		}
 	}
 
-	// Alignement + résumé DMARC
 	if dmarcInfo != nil && *headerFrom != "" {
 		fromDomain, err := domainFromAddr(*headerFrom)
 		if err != nil {
@@ -1027,7 +1054,6 @@ func main() {
 		fmt.Println("Fournis -from (et optionnellement -mailfrom, -dkim-d, ou -email -autofill-from-email).")
 	}
 
-	// Sortie JSON
 	if isJSON {
 		result.Errors = jsonErrors
 		if *autofill {
@@ -1041,18 +1067,12 @@ func main() {
 			}
 			result.EmailAutofill = af
 		}
-
-		if *jsonlOut {
-			enc := json.NewEncoder(os.Stdout)
-			if err := enc.Encode(result); err != nil {
-				log.Fatalf("Erreur encodage JSONL: %v", err)
-			}
-		} else {
-			enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(os.Stdout)
+		if !*jsonlOut {
 			enc.SetIndent("", "  ")
-			if err := enc.Encode(result); err != nil {
-				log.Fatalf("Erreur encodage JSON: %v", err)
-			}
+		}
+		if err := enc.Encode(result); err != nil {
+			log.Fatalf("Erreur encodage JSON: %v", err)
 		}
 	}
 }
