@@ -1,0 +1,5 @@
+mailauthcheck
+mailauthcheck.exe
+mailauthcheck-*
+*.sha256
+dist/
